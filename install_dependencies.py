@@ -13,6 +13,7 @@ for entries whose package name is a Python standard-library module.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shlex
@@ -23,18 +24,20 @@ import tempfile
 from pathlib import Path
 from typing import Sequence
 
+STATE_FILE = ".dependency_installer_state.json"
+
 
 def executable(name: str) -> str | None:
     return shutil.which(name)
 
 
-def run_install(label: str, command: Sequence[str], root: Path, dry_run: bool) -> bool:
+def run_install(label: str, command: Sequence[str], root: Path, dry_run: bool, action: str = "install") -> bool:
     """Run an installer command, returning whether it completed successfully."""
     if not executable(command[0]):
         print(f"[skip] {label}: command not found: {command[0]}")
         return False
 
-    print(f"[install] {label}: {shlex.join(command)}")
+    print(f"[{action}] {label}: {shlex.join(command)}")
     if dry_run:
         return True
 
@@ -102,7 +105,7 @@ def pip_install_requirements(requirement_file: Path, root: Path, dry_run: bool) 
         ) as temporary:
             temporary.write("\n".join(filtered) + "\n")
             temp_path = Path(temporary.name)
-        command = ["python3", "-m", "pip", "install", "-r", str(temp_path)]
+        command = [python, "-m", "pip", "install", "-r", str(temp_path)]
         return run_install(f"Python ({requirement_file.name})", command, root, dry_run)
     except OSError as exc:
         print(f"[error] could not prepare filtered requirements: {exc}")
@@ -180,15 +183,182 @@ def detect_installs(root: Path) -> list[tuple[str, list[str]]]:
     return installs
 
 
+def pip_packages() -> dict[str, str]:
+    """Return installed distribution names and versions for this interpreter."""
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "list", "--format=json"],
+            capture_output=True, text=True, check=False,
+        )
+        if result.returncode == 0:
+            return {
+                item["name"].lower().replace("_", "-"): item["version"]
+                for item in json.loads(result.stdout)
+            }
+    except (OSError, json.JSONDecodeError, KeyError, TypeError):
+        pass
+    return {}
+
+
+def load_state(root: Path) -> dict:
+    state_path = root / STATE_FILE
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        if isinstance(state, dict):
+            return state
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {"python": {}, "directories": []}
+
+
+def save_state(root: Path, state: dict) -> bool:
+    state_path = root / STATE_FILE
+    try:
+        state_path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        return True
+    except OSError as exc:
+        print(f"[error] could not save install record {state_path}: {exc}")
+        return False
+
+
+def node_modules_entries(root: Path) -> set[str]:
+    """Snapshot package-manager entries without walking package contents."""
+    entries: set[str] = set()
+    for current, dirs, _files in os.walk(root):
+        dirs[:] = [name for name in dirs if name not in {".git", ".venv", "venv", "vendor", "target"}]
+        if Path(current).name != "node_modules":
+            continue
+
+        modules_dir = Path(current)
+        entries.add(modules_dir.relative_to(root).as_posix())
+        dirs[:] = []  # Do not recurse into installed packages.
+        try:
+            children = list(modules_dir.iterdir())
+        except OSError:
+            continue
+        for child in children:
+            entries.add(child.relative_to(root).as_posix())
+            if child.name in {".pnpm", ".bin"} and child.is_dir():
+                try:
+                    entries.update(item.relative_to(root).as_posix() for item in child.iterdir())
+                except OSError:
+                    pass
+    return entries
+
+
+def uninstall(root: Path, dry_run: bool) -> int:
+    state_path = root / STATE_FILE
+    if not state_path.exists():
+        print(f"[info] no install record found in {root}; run install mode first")
+        return 0
+
+    state = load_state(root)
+    packages = state.get("python", {})
+    if not isinstance(packages, dict):
+        packages = {}
+
+    current = pip_packages()
+    has_tracked_artifacts = False
+    remove_packages = [
+        name for name, installed_version in packages.items()
+        if current.get(name.lower().replace("_", "-")) == installed_version
+    ]
+    if remove_packages:
+        has_tracked_artifacts = True
+        command = [sys.executable, "-m", "pip", "uninstall", "-y", *sorted(remove_packages)]
+        if dry_run:
+            print(f"[uninstall] Python packages: {shlex.join(command)}")
+        else:
+            if not run_install("Python packages installed by this script", command, root, False, action="uninstall"):
+                return 1
+    elif packages:
+        print("[info] recorded Python packages are no longer installed at their recorded versions; keeping them")
+
+    directories = state.get("directories", [])
+    if not isinstance(directories, list):
+        directories = []
+    for relative in directories:
+        path = (root / str(relative)).resolve()
+        # Only remove recorded paths inside the repository, and never the root itself.
+        if path == root or root not in path.parents:
+            print(f"[skip] unsafe recorded path: {relative}")
+            continue
+        if not path.exists():
+            continue
+        if dry_run:
+            print(f"[uninstall] remove script-created directory: {path}")
+            has_tracked_artifacts = True
+        elif path.is_dir():
+            try:
+                shutil.rmtree(path)
+                print(f"[uninstall] removed script-created directory: {path}")
+                has_tracked_artifacts = True
+            except OSError as exc:
+                print(f"[error] could not remove {path}: {exc}")
+                return 1
+        else:
+            print(f"[skip] recorded path is not a directory: {path}")
+
+    entries = state.get("node_modules_entries", [])
+    if not isinstance(entries, list):
+        entries = []
+    # Remove deepest entries first so newly-created package directories can be
+    # removed cleanly after their children. Existing entries were never saved.
+    safe_paths: list[Path] = []
+    for relative in entries:
+        # Use a lexical absolute path so a recorded symlink is unlinked itself,
+        # rather than following it into its package target.
+        path = Path(os.path.abspath(root / str(relative)))
+        if path == root or root not in path.parents:
+            print(f"[skip] unsafe recorded path: {relative}")
+            continue
+        safe_paths.append(path)
+    for path in sorted(set(safe_paths), key=lambda item: len(item.parts), reverse=True):
+        if not path.exists() and not path.is_symlink():
+            continue
+        if dry_run:
+            print(f"[uninstall] remove script-added dependency entry: {path}")
+            has_tracked_artifacts = True
+        else:
+            try:
+                if path.is_symlink() or path.is_file():
+                    path.unlink()
+                elif path.is_dir():
+                    shutil.rmtree(path)
+                print(f"[uninstall] removed script-added dependency entry: {path}")
+                has_tracked_artifacts = True
+            except OSError as exc:
+                print(f"[error] could not remove {path}: {exc}")
+                return 1
+
+    if dry_run:
+        print(f"[info] dry-run: would remove the install record {state_path}")
+    else:
+        try:
+            state_path.unlink()
+        except OSError as exc:
+            print(f"[error] could not remove install record: {exc}")
+            return 1
+    if state.get("unmanaged"):
+        print("[info] shared package-manager caches are kept because they may be used by other projects")
+    if not has_tracked_artifacts:
+        print("[info] no locally tracked dependencies were removed; this install record contains no removable artifacts")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Detect and install repository dependencies.")
     parser.add_argument("repository", nargs="?", default=".", help="repository root (default: current directory)")
     parser.add_argument("--dry-run", action="store_true", help="show install commands without running them")
+    parser.add_argument("--uninstall", action="store_true", help="remove dependencies recorded as installed by this script")
     args = parser.parse_args()
 
     root = Path(args.repository).expanduser().resolve()
     if not root.is_dir():
         parser.error(f"repository path is not a directory: {root}")
+
+    if args.uninstall:
+        return uninstall(root, args.dry_run)
 
     requirements = sorted(root.glob("requirements*.txt"))
     installs = detect_installs(root)
@@ -196,11 +366,50 @@ def main() -> int:
         print(f"[info] no supported dependency manifests found in {root}")
         return 0
 
+    state = load_state(root)
+    recorded_packages = state.setdefault("python", {})
+    if not isinstance(recorded_packages, dict):
+        recorded_packages = {}
+        state["python"] = recorded_packages
+    packages_before = pip_packages() if not args.dry_run else {}
+    node_entries_before = node_modules_entries(root) if not args.dry_run and (root / "package.json").exists() else set()
+    candidates = []
+    if (root / "package.json").exists():
+        candidates.append(root / "node_modules")
+    if (root / "composer.json").exists():
+        candidates.append(root / "vendor")
+    directories_before = {path for path in candidates if path.exists()}
+
     success = True
     for requirement_file in requirements:
         success = pip_install_requirements(requirement_file, root, args.dry_run) and success
     for label, command in installs:
         success = run_install(label, command, root, args.dry_run) and success
+
+    if not args.dry_run:
+        packages_after = pip_packages()
+        for name, version in packages_after.items():
+            if name not in packages_before:
+                recorded_packages[name] = version
+            elif name in recorded_packages and packages_before[name] == recorded_packages[name]:
+                # Keep tracking an already-owned package if this run updated it.
+                recorded_packages[name] = version
+        recorded_directories = set(state.get("directories", []))
+        for path in candidates:
+            if path not in directories_before and path.exists():
+                recorded_directories.add(path.relative_to(root).as_posix())
+        state["directories"] = sorted(recorded_directories)
+        if (root / "package.json").exists():
+            node_entries_after = node_modules_entries(root)
+            recorded_entries = set(state.get("node_modules_entries", []))
+            recorded_entries.update(node_entries_after - node_entries_before)
+            state["node_modules_entries"] = sorted(recorded_entries)
+        state["unmanaged"] = sorted({
+            label for label, _ in installs
+            if label.startswith(("Node.js", "PHP", "Go", "Rust", "Java", "Ruby", ".NET", "Elixir", "Swift"))
+            or label.startswith("Python (") and "requirements" not in label and "project" not in label
+        })
+        save_state(root, state)
 
     return 0 if success else 1
 
